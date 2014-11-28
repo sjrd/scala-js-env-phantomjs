@@ -7,16 +7,15 @@
 \*                                                                      */
 
 
-package scala.scalajs.sbtplugin.env.phantomjs
+package org.scalajs.jsenv.phantomjs
 
-import scala.scalajs.sbtplugin.env._
+import org.scalajs.jsenv._
 
-import scala.scalajs.tools.io._
-import scala.scalajs.tools.classpath._
-import scala.scalajs.tools.env._
-import scala.scalajs.tools.logging._
+import org.scalajs.core.ir.Utils.escapeJS
 
-import scala.scalajs.sbtplugin.JSUtils._
+import org.scalajs.core.tools.io._
+import org.scalajs.core.tools.classpath._
+import org.scalajs.core.tools.logging._
 
 import java.io.{ Console => _, _ }
 import java.net._
@@ -30,7 +29,7 @@ class PhantomJSEnv(
     addArgs: Seq[String] = Seq.empty,
     addEnv: Map[String, String] = Map.empty,
     val autoExit: Boolean = true,
-    jettyClassLoader: ClassLoader = getClass().getClassLoader()
+    jettyClassLoader: ClassLoader = null
 ) extends ExternalJSEnv(addArgs, addEnv) with ComJSEnv {
 
   import PhantomJSEnv._
@@ -69,8 +68,12 @@ class PhantomJSEnv(
        with ComJSRunner with WebsocketListener {
 
     private def loadMgr() = {
-      val clazz = jettyClassLoader.loadClass(
-          "scala.scalajs.sbtplugin.env.phantomjs.JettyWebsocketManager")
+      val loader =
+        if (jettyClassLoader != null) jettyClassLoader
+        else getClass().getClassLoader()
+
+      val clazz = loader.loadClass(
+          "org.scalajs.jsenv.phantomjs.JettyWebsocketManager")
 
       val ctors = clazz.getConstructors()
       assert(ctors.length == 1, "JettyWebsocketManager may only have one ctor")
@@ -369,7 +372,7 @@ class PhantomJSEnv(
         out.write(
             s"""// Scala.js Phantom.js launcher
                |var page = require('webpage').create();
-               |var url = ${toJSstr(webF.getAbsolutePath)};
+               |var url = "${escapeJS(webF.getAbsolutePath)}";
                |var autoExit = $autoExit;
                |page.onConsoleMessage = function(msg) {
                |  console.log(msg);
