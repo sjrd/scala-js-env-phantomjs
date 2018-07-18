@@ -1,92 +1,108 @@
 package org.scalajs.jsenv.phantomjs
 
-import org.scalajs.io.VirtualJSFile
+import scala.concurrent._
 
-import org.scalajs.logging._
+import org.junit.Test
+import org.junit.Assert._
 
+import org.scalajs.io._
+
+import org.scalajs.jsenv._
 import org.scalajs.jsenv.nodejs.NodeJSEnv
-import org.scalajs.jsenv.{ComJSRunner, JSConsole, _}
 import org.scalajs.jsenv.test._
 
-import scala.concurrent.Future
-import scala.concurrent.duration.Duration
+class RetryingComJSEnvTest {
+  import RetryingComJSEnvTest._
 
-class RetryingComJSEnvTest extends JSEnvTest with ComTests {
+  @Test
+  def basicComTestWithRetries: Unit = {
+    val failingJSEnv = new FailingEnv
+    val config = JSEnvSuiteConfig(new RetryingComJSEnv(failingJSEnv))
+    val kit = new TestComKit(config)
 
-  private final val maxFails = 5
+    val run = kit.start("""
+      scalajsCom.init(function(msg) { scalajsCom.send("received: " + msg); });
+      setTimeout(function() {
+        scalajsCom.send("Hello World");
+      }, 1000);
+    """, RunConfig())
 
-  // Don't log anything here
-  override protected def start(runner: AsyncJSRunner): Future[Unit] = {
-    runner.start(NullLogger, ConsoleJSConsole)
+    try {
+      Thread.sleep(200L)
+      assertEquals(2, failingJSEnv.attempt)
+      run.run.send("Initial")
+      Thread.sleep(200L)
+      assertEquals(3, failingJSEnv.attempt)
+      assertEquals("received: Initial", run.waitNextMessage())
+
+      assertEquals("Hello World", run.waitNextMessage())
+
+      for (i <- 0 to 10) {
+        run.run.send(i.toString)
+        assertEquals(s"received: $i", run.waitNextMessage())
+      }
+    } finally {
+      run.closeAndWait()
+    }
   }
 
-  protected def newJSEnv: RetryingComJSEnv =
-    new RetryingComJSEnv(new FailingEnv(new NodeJSEnv), maxFails)
+}
 
-  private final class FailingEnv(baseEnv: ComJSEnv) extends ComJSEnv {
-    def name: String = s"FailingJSEnv of ${baseEnv.name}"
+object RetryingComJSEnvTest {
 
-    private[this] var fails = 0
-    private[this] var failedReceive = false
+  private final class FailingEnv extends JSEnv {
+    private val baseEnv = new NodeJSEnv()
 
-    def jsRunner(files: Seq[VirtualJSFile]): JSRunner =
-      baseEnv.jsRunner(files)
+    val name: String = s"FailingJSEnv of ${baseEnv.name}"
 
-    def asyncRunner(files: Seq[VirtualJSFile]): AsyncJSRunner =
-      baseEnv.asyncRunner(files)
+    @volatile
+    var attempt = 0
 
-    def comRunner(files: Seq[VirtualJSFile]): ComJSRunner =
-      new FailingComJSRunner(baseEnv.comRunner(files))
+    def start(input: Input, config: RunConfig): JSRun =
+      baseEnv.start(input, config)
 
-    /** Hack to work around abstract override in ComJSRunner */
-    private trait DummyJSRunner {
-      def stop(): Unit = ()
+    def startWithCom(input: Input, config: RunConfig,
+        onMessage: String => Unit): JSComRun = {
+
+      FailingEnv.validator.validate(config)
+
+      attempt += 1
+      attempt match {
+        case 1 =>
+          // An immediately failed JSComRun
+          JSComRun.failed(
+              new IllegalStateException("Dummy fail for testing purposes 1"))
+
+        case 2 =>
+          // A JSComRun that fails after a message has been sent
+          new JSComRun {
+            private[this] val promise = Promise[Unit]()
+
+            def close(): Unit = promise.trySuccess(())
+            def future: Future[Unit] = promise.future
+
+            def send(msg: String): Unit = {
+              promise.tryFailure(
+                  new UnsupportedOperationException("Dummy fail for testing purposes 2"))
+            }
+          }
+
+        case 3 =>
+          // A correct run
+          baseEnv.startWithCom(input, config, onMessage)
+
+        case _ =>
+          fail("Trying to retry a FailingEnv for more than 3 times")
+          throw new Error("unreachable")
+      }
     }
+  }
 
-    private class FailingComJSRunner(baseRunner: ComJSRunner)
-        extends DummyJSRunner with ComJSRunner {
-
-      def future: Future[Unit] = baseRunner.future
-
-      def send(msg: String): Unit = {
-        maybeFail()
-        baseRunner.send(msg)
-      }
-
-      def receive(timeout: Duration): String = {
-        if (shouldFail) {
-          failedReceive = true
-          fail()
-        }
-        baseRunner.receive(timeout)
-      }
-
-      def start(logger: Logger, console: JSConsole): Future[Unit] = {
-        maybeFail()
-        baseRunner.start(logger, console)
-      }
-
-      override def stop(): Unit = {
-        maybeFail()
-        baseRunner.stop()
-      }
-
-      def close(): Unit = {
-        maybeFail()
-        baseRunner.close()
-      }
-
-      private def shouldFail = !failedReceive && fails < maxFails
-
-      private def maybeFail() = {
-        if (shouldFail)
-          fail()
-      }
-
-      private def fail() = {
-        fails += 1
-        sys.error("Dummy fail for testing purposes")
-      }
+  private object FailingEnv {
+    private val validator = {
+      RunConfig.Validator()
+        .supportsInheritIO()
+        .supportsOnOutputStream()
     }
   }
 

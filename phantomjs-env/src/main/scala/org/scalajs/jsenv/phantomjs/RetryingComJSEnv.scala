@@ -30,165 +30,103 @@ import scala.util.{Try, Failure, Success}
  *  (e.g. writing to a file). It is the users responsibility to ensure this
  *  property.
  *
- *  No retrying is performed for synchronous, or normal asynchronous runs.
+ *  No retrying is performed for non-com runs (initiated with `start`).
  *
  *  Although `RetryingComJSEnv` is agnostic of the underlying JS env, and is
  *  therefore not tied to PhantomJS, it is most often used to compensate for
  *  flakiness effects of PhantomJS.
  */
-final class RetryingComJSEnv(val baseEnv: ComJSEnv,
-    val maxRetries: Int) extends ComJSEnv {
+final class RetryingComJSEnv(val baseEnv: JSEnv, val maxRetries: Int)
+    extends JSEnv {
 
-  def this(baseEnv: ComJSEnv) = this(baseEnv, 5)
+  def this(baseEnv: JSEnv) = this(baseEnv, 5)
 
-  def name: String = s"Retrying ${baseEnv.name}"
+  val name: String = s"Retrying ${baseEnv.name}"
 
-  def jsRunner(files: Seq[VirtualJSFile]): JSRunner =
-    baseEnv.jsRunner(files)
+  def start(input: Input, runConfig: RunConfig): JSRun =
+    baseEnv.start(input, runConfig)
 
-  def asyncRunner(files: Seq[VirtualJSFile]): AsyncJSRunner =
-    baseEnv.asyncRunner(files)
-
-  def comRunner(files: Seq[VirtualJSFile]): ComJSRunner =
-    new RetryingComJSRunner(files)
-
-  /** Hack to work around abstract override in ComJSRunner */
-  private trait DummyJSRunner {
-    def stop(): Unit = ()
+  def startWithCom(input: Input, runConfig: RunConfig,
+      onMessage: String => Unit): JSComRun = {
+    new RetryingJSComRun(input, runConfig, onMessage)
   }
 
-  private class RetryingComJSRunner(files: Seq[VirtualJSFile])
-      extends DummyJSRunner with ComJSRunner {
+  private class RetryingJSComRun(input: Input, runConfig: RunConfig,
+      onMessage: String => Unit)
+      extends JSComRun {
 
     private[this] val promise = Promise[Unit]
 
-    private[this] var curRunner = baseEnv.comRunner(files)
+    def future: Future[Unit] = promise.future
 
     private[this] var hasReceived = false
     private[this] var retryCount = 0
 
     private[this] val log = mutable.Buffer.empty[LogItem]
 
-    private[this] var _logger: Logger = _
-    private[this] var _console: JSConsole = _
+    private[this] var curRun: JSComRun = _
+    startNewRun()
 
-    def future: Future[Unit] = promise.future
+    private def startNewRun(): Unit = {
+      import ExecutionContext.Implicits.global
 
-    def start(logger: Logger, console: JSConsole): Future[Unit] = {
-      require(log.isEmpty, "start() may only be called once")
+      val myRetryCount = retryCount
 
-      _logger = logger
-      _console = console
-
-      logAndDo(Start)
-      future
-    }
-
-    override def stop(): Unit = {
-      require(log.nonEmpty, "start() must have been called")
-      close()
-      logAndDo(Stop)
-    }
-
-    def send(msg: String): Unit = {
-      require(log.nonEmpty, "start() must have been called")
-      logAndDo(Send(msg))
-    }
-
-    def receive(timeout: Duration): String = {
-      @tailrec
-      def recLoop(): String = {
-        // Need to use Try for tailrec
-        Try {
-          val result = curRunner.receive(timeout)
-          // At this point, we are sending state to the JVM, we cannot retry
-          // after this.
-          hasReceived = true
-          result
-        } match {
-          case Failure(t) =>
-            retry(t)
-            recLoop()
-          case Success(v) => v
-        }
-      }
-
-      recLoop()
-    }
-
-    def close(): Unit = {
-      require(log.nonEmpty, "start() must have been called")
-      logAndDo(Close)
-    }
-
-    @tailrec
-    private final def retry(cause: Throwable): Unit = {
-      retryCount += 1
-
-      // Accesses to promise and swaps in the curRunner must be synchronized
-      synchronized {
-        if (hasReceived || retryCount > maxRetries || promise.isCompleted)
-          throw cause
-
-        _logger.warn("Retrying to launch a " + baseEnv.getClass.getName +
-          " after " + cause.toString)
-
-        val oldRunner = curRunner
-
-        curRunner = try {
-          baseEnv.comRunner(files)
-        } catch {
-          case NonFatal(t) =>
-            _logger.error("Could not retry: creating an new runner failed: " +
-              t.toString)
-            throw cause
-        }
-
-        try oldRunner.stop() // just in case
-        catch {
-          case NonFatal(t) => // ignore
-        }
-      }
-
-      // Replay the whole log
-      // Need to use Try for tailrec
-      Try(log.foreach(executeTask)) match {
-        case Failure(t) => retry(t)
-        case _ =>
-      }
-    }
-
-    private def logAndDo(task: LogItem) = {
-      log += task
-      try executeTask(task)
-      catch {
-        case NonFatal(t) => retry(t)
-      }
-    }
-
-    private def executeTask(task: LogItem) = task match {
-      case Start =>
-        import ExecutionContext.Implicits.global
-        val runner = curRunner
-        runner.start(_logger, _console) onComplete { result =>
-          // access to curRunner and promise must be synchronized
-          synchronized {
-            if (curRunner eq runner)
-              promise.complete(result)
+      val run = baseEnv.startWithCom(input, runConfig, { msg =>
+        val doForward = synchronized {
+          if (retryCount == myRetryCount) {
+            /* At this point, we are sending state to the JVM, we cannot retry
+             * after this.
+             */
+            hasReceived = true
+            true
+          } else {
+            false
           }
         }
+        if (doForward)
+          onMessage(msg) // outside of synchronized
+      })
+      curRun = run
+
+      run.future.onComplete { result =>
+        synchronized {
+          if (retryCount == myRetryCount) {
+            result match {
+              case Failure(_) if !hasReceived && retryCount < maxRetries =>
+                retryCount += 1
+                startNewRun()
+                log.foreach(executeTask)
+
+              case _ =>
+                promise.complete(result)
+            }
+          }
+        }
+      }
+    }
+
+    def send(msg: String): Unit =
+      logAndDo(Send(msg))
+
+    def close(): Unit =
+      logAndDo(Close)
+
+    private def logAndDo(task: LogItem): Unit = synchronized {
+      log += task
+      executeTask(task)
+    }
+
+    /** Async, nothrow. */
+    private def executeTask(task: LogItem): Unit = task match {
       case Send(msg) =>
-        curRunner.send(msg)
-      case Stop =>
-        curRunner.stop()
+        curRun.send(msg)
       case Close =>
-        curRunner.close()
+        curRun.close()
     }
 
     private sealed trait LogItem
-    private case object Start extends LogItem
     private case class Send(msg: String) extends LogItem
-    private case object Stop extends LogItem
     private case object Close extends LogItem
 
   }
