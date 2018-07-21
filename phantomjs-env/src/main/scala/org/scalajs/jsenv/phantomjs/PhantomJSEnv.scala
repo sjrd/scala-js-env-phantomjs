@@ -147,7 +147,6 @@ final class PhantomJSEnv(config: PhantomJSEnv.Config) extends JSEnv {
           s"""// Scala.js Phantom.js launcher
              |var page = require('webpage').create();
              |var url = "${escapeJS(fixFileURI(webF.toURI).toASCIIString)}";
-             |var autoExit = ${config.autoExit};
              |page.onConsoleMessage = function(msg) {
              |  console.log(msg);
              |};
@@ -169,19 +168,14 @@ final class PhantomJSEnv(config: PhantomJSEnv.Config) extends JSEnv {
              |    phantom.exit(3);
              |  } else if (data.action === 'exit') {
              |    phantom.exit(data.returnValue || 0);
-             |  } else if (data.action === 'setAutoExit') {
-             |    if (typeof(data.autoExit) === 'boolean')
-             |      autoExit = data.autoExit;
-             |    else
-             |      autoExit = true;
              |  } else {
              |    console.error('Unknown callback action ' + data.action);
              |    phantom.exit(4);
              |  }
              |};
              |page.open(url, function (status) {
-             |  if (autoExit || status !== 'success')
-             |    phantom.exit(status !== 'success');
+             |  if (status !== 'success')
+             |    phantom.exit(1);
              |});
              |""".stripMargin)
     } finally {
@@ -317,7 +311,6 @@ object PhantomJSEnv {
       val executable: String,
       val args: List[String],
       val env: Map[String, String],
-      val autoExit: Boolean,
       val jettyClassLoader: ClassLoader
   ) {
     private def this() = {
@@ -325,7 +318,6 @@ object PhantomJSEnv {
           executable = "phantomjs",
           args = Nil,
           env = Map.empty,
-          autoExit = true,
           jettyClassLoader = null
       )
     }
@@ -339,9 +331,6 @@ object PhantomJSEnv {
     def withEnv(env: Map[String, String]): Config =
       copy(env = env)
 
-    def withAutoExit(autoExit: Boolean): Config =
-      copy(autoExit = autoExit)
-
     def withJettyClassLoader(jettyClassLoader: ClassLoader): Config =
       copy(jettyClassLoader = jettyClassLoader)
 
@@ -349,10 +338,9 @@ object PhantomJSEnv {
         executable: String = executable,
         args: List[String] = args,
         env: Map[String, String] = env,
-        autoExit: Boolean = autoExit,
         jettyClassLoader: ClassLoader = jettyClassLoader
     ): Config = {
-      new Config(executable, args, env, autoExit, jettyClassLoader)
+      new Config(executable, args, env, jettyClassLoader)
     }
   }
 
@@ -364,7 +352,6 @@ object PhantomJSEnv {
      *  - `executable`: `"phantomjs"`
      *  - `args`: `Nil`
      *  - `env`: `Map.empty`
-     *  - `autoExit`: `true`
      *  - `jettyClassLoader`: `null` (will use the current class loader)
      */
     def apply(): Config = new Config()

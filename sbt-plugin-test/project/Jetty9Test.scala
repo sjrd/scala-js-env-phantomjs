@@ -33,11 +33,9 @@ object Jetty9Test {
         xhr.open("GET", msg);
         xhr.onload = (function() {
           scalajsCom.send(xhr.responseText.trim());
-          scalajsCom.close();
         });
         xhr.onerror = (function() {
           scalajsCom.send("failed!");
-          scalajsCom.close();
         });
         xhr.send();
       });

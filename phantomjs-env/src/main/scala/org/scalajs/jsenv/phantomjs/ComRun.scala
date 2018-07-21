@@ -87,12 +87,6 @@ private final class ComRun(jettyClassLoader: ClassLoader,
   }
 
   private def makeComSetupFile(): VirtualBinaryFile = {
-    def maybeExit(code: Int) =
-      if (true /*config.autoExit*/)
-        s"window.callPhantom({ action: 'exit', returnValue: $code });"
-      else
-        ""
-
     val serverPort = mgr.localPort
     assert(serverPort > 0,
         s"Manager running with a non-positive port number: $serverPort")
@@ -101,11 +95,46 @@ private final class ComRun(jettyClassLoader: ClassLoader,
       |(function() {
       |  var MaxPayloadSize = $MaxCharPayloadSize;
       |
-      |  // The socket for communication
-      |  var websocket = null;
+      |  // Buffers received messages
+      |  var inMessages = [];
+      |  var receiveFragment = "";
+      |
+      |  // The callback where received messages go
+      |  var onMessage = null;
       |
       |  // Buffer for messages sent before socket is open
-      |  var outMsgBuf = null;
+      |  var outMsgBuf = [];
+      |
+      |  // The socket for communication
+      |  var websocket = new WebSocket("ws://localhost:$serverPort");
+      |
+      |  websocket.onopen = function(evt) {
+      |    for (var i = 0; i < outMsgBuf.length; ++i)
+      |      sendImpl(outMsgBuf[i]);
+      |    outMsgBuf = null;
+      |  };
+      |  websocket.onclose = function(evt) {
+      |    websocket = null;
+      |    window.callPhantom({ action: 'exit', returnValue: 0 });
+      |  };
+      |  websocket.onmessage = function(evt) {
+      |    var newData = receiveFragment + evt.data.substring(1);
+      |    if (evt.data.charAt(0) == "0") {
+      |      receiveFragment = "";
+      |      if (inMessages !== null)
+      |        inMessages.push(newData);
+      |      else
+      |        onMessage(newData);
+      |    } else if (evt.data.charAt(0) == "1") {
+      |      receiveFragment = newData;
+      |    } else {
+      |      throw new Error("Bad fragmentation flag in " + evt.data);
+      |    }
+      |  };
+      |  websocket.onerror = function(evt) {
+      |    websocket = null;
+      |    throw new Error("Websocket failed: " + evt);
+      |  };
       |
       |  function sendImpl(msg) {
       |    var frags = (msg.length / MaxPayloadSize) | 0;
@@ -119,52 +148,17 @@ private final class ComRun(jettyClassLoader: ClassLoader,
       |    websocket.send("0" + msg.substring(frags * MaxPayloadSize));
       |  }
       |
-      |  function recvImpl(recvCB) {
-      |    var recvBuf = "";
-      |
-      |    return function(evt) {
-      |      var newData = recvBuf + evt.data.substring(1);
-      |      if (evt.data.charAt(0) == "0") {
-      |        recvBuf = "";
-      |        recvCB(newData);
-      |      } else if (evt.data.charAt(0) == "1") {
-      |        recvBuf = newData;
-      |      } else {
-      |        throw new Error("Bad fragmentation flag in " + evt.data);
-      |      }
-      |    };
-      |  }
-      |
       |  window.scalajsCom = {
-      |    init: function(recvCB) {
-      |      if (websocket !== null) throw new Error("Com already open");
+      |    init: function(onMsg) {
+      |      if (onMessage !== null)
+      |        throw new Error("Com already initialized");
       |
-      |      outMsgBuf = [];
-      |
-      |      websocket = new WebSocket("ws://localhost:$serverPort");
-      |
-      |      websocket.onopen = function(evt) {
-      |        for (var i = 0; i < outMsgBuf.length; ++i)
-      |          sendImpl(outMsgBuf[i]);
-      |        outMsgBuf = null;
-      |      };
-      |      websocket.onclose = function(evt) {
-      |        websocket = null;
-      |        if (outMsgBuf !== null)
-      |          throw new Error("WebSocket closed before being opened: " + evt);
-      |        ${maybeExit(0)}
-      |      };
-      |      websocket.onmessage = recvImpl(recvCB);
-      |      websocket.onerror = function(evt) {
-      |        websocket = null;
-      |        throw new Error("Websocket failed: " + evt);
-      |      };
-      |
-      |      // Take over responsibility to auto exit
-      |      window.callPhantom({
-      |        action: 'setAutoExit',
-      |        autoExit: false
-      |      });
+      |      onMessage = onMsg;
+      |      setTimeout(function() {
+      |        for (var i = 0; i < inMessages.length; ++i)
+      |          onMessage(inMessages[i]);
+      |        inMessages = null;
+      |      }, 0);
       |    },
       |    send: function(msg) {
       |      if (websocket === null)
@@ -174,16 +168,6 @@ private final class ComRun(jettyClassLoader: ClassLoader,
       |        outMsgBuf.push(msg);
       |      else
       |        sendImpl(msg);
-      |    },
-      |    close: function() {
-      |      if (websocket === null)
-      |        return; // we are closed already. all is well.
-      |
-      |      if (outMsgBuf !== null)
-      |        // Reschedule ourselves to give onopen a chance to kick in
-      |        window.setTimeout(window.scalajsCom.close, 10);
-      |      else
-      |        websocket.close();
       |    }
       |  }
       |}).call(this);""".stripMargin
